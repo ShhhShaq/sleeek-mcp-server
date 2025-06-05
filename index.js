@@ -1,241 +1,198 @@
-#!/usr/bin/env node
-import { Server } from '@modelcontextprotocol/sdk/server/index.js';
-import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import express from 'express';
+import cors from 'cors';
 import OpenAI from 'openai';
 import dotenv from 'dotenv';
 
 dotenv.config();
 
-class SleeekMCPServer {
-  constructor() {
-    this.server = new Server(
-      {
-        name: 'sleeek-photo-assessor',
-        version: '1.0.0',
-      },
-      {
-        capabilities: {
-          tools: {},
-        },
-      }
-    );
+const app = express();
+app.use(express.json({ limit: '50mb' }));
+app.use(cors());
 
-    this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY
-    });
+// Initialize OpenAI
+const openai = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY
+});
 
-    // In production, use a database like PostgreSQL or MongoDB
-    this.assessmentContexts = new Map();
-    
-    this.setupHandlers();
-  }
+// In-memory storage for assessment history
+const assessmentHistory = {};
 
-  setupHandlers() {
-    this.server.setRequestHandler('tools/list', async () => ({
-      tools: [
+// Health check
+app.get('/health', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    service: 'sleeek-assessment-server',
+    version: '2.0.0'
+  });
+});
+
+// Main assessment endpoint
+app.post('/assess', async (req, res) => {
+  console.log(`[${new Date().toISOString()}] Assessment request for ${req.body.roomType}`);
+  
+  try {
+    const { imageBase64, roomType, shootId, stackIndex, currentAngle } = req.body;
+
+    if (!imageBase64 || !roomType || !shootId) {
+      return res.status(400).json({
+        error: 'Missing required fields',
+        details: 'imageBase64, roomType, and shootId are required'
+      });
+    }
+
+    // Initialize history for this shoot/room if needed
+    const historyKey = `${shootId}-${roomType}`;
+    if (!assessmentHistory[historyKey]) {
+      assessmentHistory[historyKey] = {
+        attempts: 0,
+        constraints: [],
+        lastFeedback: null,
+        acceptedAfterAttempts: false
+      };
+    }
+
+    const history = assessmentHistory[historyKey];
+    history.attempts++;
+
+    // Call OpenAI Vision API
+    const response = await openai.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
         {
-          name: 'assess_photo',
-          description: 'Assess a real estate photo with context awareness',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              imageBase64: { type: 'string' },
-              roomType: { type: 'string' },
-              shootId: { type: 'string' },
-              stackIndex: { type: 'number' },
-              currentAngle: {
-                type: 'object',
-                properties: {
-                  pitch: { type: 'number' },
-                  yaw: { type: 'number' },
-                  roll: { type: 'number' }
-                }
-              }
+          role: 'system',
+          content: `You are a practical real estate photography assistant with context awareness.
+
+CURRENT ROOM: ${roomType.toUpperCase()}
+ATTEMPT NUMBER: ${history.attempts}
+${history.constraints.length > 0 ? `KNOWN CONSTRAINTS: ${history.constraints.join(', ')}` : ''}
+
+CRITICAL ASSESSMENT RULES:
+
+1. CONTEXT AWARENESS:
+- This is attempt #${history.attempts} for this shot
+- ${history.attempts >= 3 ? 'After 3+ attempts, be more lenient and accepting' : 'Provide helpful guidance'}
+- ${history.constraints.includes("can't move back") ? "Photographer confirmed they CANNOT back up further" : ''}
+
+2. PHYSICAL CONSTRAINTS - BE REALISTIC:
+- If photographer says they can't move back, NEVER suggest it again
+- Accept the shot if it shows the key elements of the ${roomType}
+- Minor issues can be fixed in post-production
+
+3. PROGRESSIVE ACCEPTANCE:
+- Attempt 1-2: Normal standards
+- Attempt 3-4: More accepting, focus on major issues only
+- Attempt 5+: Accept if it's usable at all
+
+4. TONE:
+- Always supportive and understanding
+- Acknowledge their constraints
+- Be encouraging, especially after multiple attempts
+
+Remember: They're doing their best in real-world conditions. Be helpful, not perfectionist.`
+        },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text: history.attempts >= 3 
+                ? `This is attempt #${history.attempts}. What do you think of this shot?`
+                : 'What micro-adjustment would perfect this composition?'
             },
-            required: ['imageBase64', 'roomType', 'shootId']
-          }
+            {
+              type: 'image_url',
+              image_url: {
+                url: `data:image/jpeg;base64,${imageBase64}`,
+                detail: 'low'
+              }
+            }
+          ]
         }
-      ]
-    }));
-
-    this.server.setRequestHandler('tools/call', async (request) => {
-      const { name, arguments: args } = request.params;
-      
-      if (name === 'assess_photo') {
-        return this.assessPhoto(args);
-      }
-      
-      throw new Error(`Unknown tool: ${name}`);
+      ],
+      max_tokens: 60,
+      temperature: 0.4
     });
-  }
 
-  async assessPhoto(params) {
-    const { imageBase64, roomType, shootId, stackIndex, currentAngle } = params;
-    
-    const contextKey = `${shootId}:${roomType}`;
-    let context = this.assessmentContexts.get(contextKey) || {
-      shootId,
-      roomType,
-      attempts: 0,
-      assessments: [],
-      constraints: new Set(),
-      lastAngle: null,
-      improvements: []
+    const feedback = response.choices[0]?.message?.content || 'Unable to analyze photo';
+
+    // Update history
+    history.lastFeedback = feedback;
+
+    // Check if accepted
+    const isAcceptable = 
+      feedback.toLowerCase().includes('good') ||
+      feedback.toLowerCase().includes('great') ||
+      feedback.toLowerCase().includes('perfect') ||
+      feedback.toLowerCase().includes('snap') ||
+      feedback.toLowerCase().includes('capture') ||
+      history.attempts >= 5;
+
+    if (isAcceptable) {
+      history.acceptedAfterAttempts = true;
+    }
+
+    // Extract constraints from feedback
+    if (feedback.toLowerCase().includes("can't") || feedback.toLowerCase().includes('cannot')) {
+      if (feedback.toLowerCase().includes('back')) {
+        history.constraints.push("can't move back");
+      }
+    }
+
+    // Build response matching MCPAssessmentResponse structure
+    const assessmentResponse = {
+      feedback,
+      attemptNumber: history.attempts,
+      angleReset: false,
+      score: isAcceptable ? 85 : 70,
+      isAcceptable,
+      constraints: history.constraints,
+      improvements: isAcceptable ? [] : ['Adjust based on feedback']
     };
 
-    // Check for angle change
-    let angleReset = false;
-    if (context.lastAngle && currentAngle) {
-      const angleDiff = this.calculateAngleDifference(context.lastAngle, currentAngle);
-      if (angleDiff > 30) {
-        angleReset = true;
-        context.attempts = 0;
-        context.assessments = [];
-      }
-    }
+    console.log(`[${new Date().toISOString()}] Assessment complete:`, feedback.substring(0, 50) + '...');
+    res.json(assessmentResponse);
 
-    context.attempts++;
-
-    // Build context-aware prompt
-    let systemPrompt = `You are a professional real estate photographer providing guidance.
-Room type: ${roomType}
-Attempt: ${context.attempts}${angleReset ? ' (NEW ANGLE)' : ''}
-
-CRITICAL RULES:
-1. Focus ONLY on composition, framing, and camera position
-2. NEVER mention lighting, exposure, brightness, or shadows
-3. Be specific about room features you can see in THIS image
-4. Maximum 40 words
-5. For attempt 3+, be very accepting and encourage capture`;
-
-    if (context.assessments.length > 0 && !angleReset) {
-      const recent = context.assessments.slice(-2);
-      systemPrompt += '\n\nPrevious feedback given:';
-      recent.forEach(a => {
-        systemPrompt += `\n- "${a.feedback}"`;
-      });
-      systemPrompt += '\n\nProvide DIFFERENT advice. Do not repeat previous suggestions.';
-    }
-
-    if (context.constraints.size > 0) {
-      systemPrompt += '\n\nKnown constraints:';
-      context.constraints.forEach(c => {
-        systemPrompt += `\n- ${c}`;
-      });
-    }
-
-    try {
-      const response = await this.openai.chat.completions.create({
-        model: "gpt-4-vision-preview",
-        messages: [
-          {
-            role: "system",
-            content: systemPrompt
-          },
-          {
-            role: "user",
-            content: [
-              {
-                type: "text",
-                text: "Assess this real estate photo's composition."
-              },
-              {
-                type: "image_url",
-                image_url: {
-                  url: `data:image/jpeg;base64,${imageBase64}`
-                }
-              }
-            ]
-          }
-        ],
-        max_tokens: 100,
-        temperature: 0.7
-      });
-
-      const feedback = response.choices[0].message.content;
-
-      // Extract constraints
-      const detectedConstraints = this.extractConstraints(feedback);
-      detectedConstraints.forEach(c => context.constraints.add(c));
-
-      // Store assessment
-      const assessment = {
-        timestamp: new Date().toISOString(),
-        attemptNumber: context.attempts,
-        feedback,
-        angle: currentAngle,
-        angleReset
-      };
-
-      context.assessments.push(assessment);
-      context.lastAngle = currentAngle;
-
-      this.assessmentContexts.set(contextKey, context);
-
-      return {
-        content: [
-          {
-            type: 'text',
-            text: JSON.stringify({
-              feedback,
-              attemptNumber: context.attempts,
-              angleReset,
-              score: this.calculateScore(context.attempts),
-              isAcceptable: context.attempts >= 3,
-              constraints: Array.from(context.constraints)
-            }, null, 2)
-          }
-        ]
-      };
-    } catch (error) {
-      console.error('OpenAI error:', error);
-      throw error;
-    }
+  } catch (error) {
+    console.error('Assessment error:', error);
+    res.status(500).json({
+      error: 'Assessment failed',
+      details: error.message
+    });
   }
+});
 
-  calculateAngleDifference(angle1, angle2) {
-    if (!angle1 || !angle2) return 0;
-    const dPitch = Math.abs(angle1.pitch - angle2.pitch);
-    const dYaw = Math.abs(angle1.yaw - angle2.yaw);
-    const dRoll = Math.abs(angle1.roll - angle2.roll);
-    return Math.sqrt(dPitch * dPitch + dYaw * dYaw + dRoll * dRoll);
-  }
+// Get assessment history
+app.get('/history/:shootId/:roomType', (req, res) => {
+  const { shootId, roomType } = req.params;
+  const historyKey = `${shootId}-${roomType}`;
+  
+  res.json(assessmentHistory[historyKey] || null);
+});
 
-  extractConstraints(feedback) {
-    const constraints = [];
-    const lower = feedback.toLowerCase();
-    
-    if (lower.includes("can't move back") || lower.includes("cannot move back")) {
-      constraints.push("Limited space - cannot move back further");
+// Clear assessment history
+app.delete('/history/:shootId', (req, res) => {
+  const { shootId } = req.params;
+  
+  // Clear all rooms for this shoot
+  Object.keys(assessmentHistory).forEach(key => {
+    if (key.startsWith(shootId)) {
+      delete assessmentHistory[key];
     }
-    if (lower.includes("wall behind") || lower.includes("against wall")) {
-      constraints.push("Wall directly behind camera position");
-    }
-    
-    return constraints;
-  }
+  });
+  
+  res.json({ message: 'History cleared' });
+});
 
-  calculateScore(attemptNumber) {
-    switch (attemptNumber) {
-      case 1: return 75;
-      case 2: return 82;
-      case 3: return 88;
-      default: return 90;
-    }
-  }
+// Error handling
+app.use((err, req, res, next) => {
+  console.error('Express error:', err);
+  res.status(500).json({ error: 'Internal server error' });
+});
 
-  async run() {
-    const transport = new StdioServerTransport();
-    await this.server.connect(transport);
-    console.error('Sleeek MCP Server running');
-  }
-}
-
-// Export for HTTP bridge
-export { SleeekMCPServer };
-
-// Run if called directly
-if (import.meta.url === `file://${process.argv[1]}`) {
-  const server = new SleeekMCPServer();
-  server.run().catch(console.error);
-}
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`\n🚀 Simple Assessment Server running on port ${PORT}`);
+  console.log(`📍 Health check: http://localhost:${PORT}/health`);
+  console.log(`🔑 OpenAI API Key: ${process.env.OPENAI_API_KEY ? 'Configured ✓' : 'Missing ✗'}`);
+  console.log('\nReady to handle assessment requests...\n');
+});
